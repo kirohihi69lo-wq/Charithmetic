@@ -1,0 +1,423 @@
+# MIT © HIROKI
+# Pure-Python security CLI: hash/HMAC/KDF/password/TOTP/archives.
+
+from __future__ import annotations
+import os
+import io
+import sys
+import json
+import time
+import hmac
+import math
+import base64
+import argparse
+import hashlib
+import tarfile
+import tempfile
+from typing import Optional, Dict, Any
+
+ERROR_LOG = "error_log.txt"
+
+
+def log_err(msg: str) -> None:
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.time():.3f}\t{msg}\n")
+    except Exception:
+        pass
+
+
+def _b64e(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+
+def _b64d(s: str) -> bytes:
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _read_all(path: Optional[str]) -> bytes:
+    if path and path != "-":
+        with open(path, "rb") as f:
+            return f.read()
+    return sys.stdin.buffer.read()
+
+
+def _write_all(path: Optional[str], data: bytes) -> None:
+    if path and path != "-":
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    else:
+        sys.stdout.buffer.write(data)
+
+
+def _now_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+# --- Hash ------------------------------------------------------------------
+
+def do_hash(alg: str, path: Optional[str]) -> None:
+    try:
+        data = _read_all(path)
+        h = hashlib.new(alg)
+        h.update(data)
+        out = {
+            "alg": alg,
+            "hex": h.hexdigest(),
+            "b64": _b64e(h.digest()),
+            "size": len(data),
+        }
+        print(json.dumps(out, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"hash failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- HMAC ------------------------------------------------------------------
+
+def do_hmac(alg: str, key_b64: str, path: Optional[str]) -> None:
+    try:
+        key = _b64d(key_b64)
+        data = _read_all(path)
+        sig = hmac.new(key, data, getattr(hashlib, alg)).digest()
+        out = {"alg": alg, "hmac": _b64e(sig), "size": len(data)}
+        print(json.dumps(out, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"hmac failed: {e!r}")
+        raise SystemExit(1)
+
+
+def do_hmac_verify(alg: str, key_b64: str, sig_b64: str,
+                   path: Optional[str]) -> None:
+    try:
+        key = _b64d(key_b64)
+        sig = _b64d(sig_b64)
+        data = _read_all(path)
+        calc = hmac.new(key, data, getattr(hashlib, alg)).digest()
+        ok = hmac.compare_digest(calc, sig)
+        print(json.dumps({"ok": ok}, ensure_ascii=False))
+        if not ok:
+            raise SystemExit(2)
+    except Exception as e:
+        log_err(f"hmac verify failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- Secrets ---------------------------------------------------------------
+
+def do_gen_secret(nbytes: int) -> None:
+    try:
+        n = max(16, min(4096, nbytes))
+        key = os.urandom(n)
+        print(json.dumps({"b64": _b64e(key)}, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"gen_secret failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- KDF / Password --------------------------------------------------------
+
+def _scrypt(password: bytes, salt: bytes,
+            n: int, r: int, p: int, dklen: int) -> bytes:
+    return hashlib.scrypt(password=password, salt=salt,
+                          n=n, r=r, p=p, dklen=dklen)
+
+
+def _pbkdf2(password: bytes, salt: bytes,
+            iters: int, dklen: int, alg: str) -> bytes:
+    return hashlib.pbkdf2_hmac(alg, password, salt, iters, dklen)
+
+
+def do_kdf(method: str, pass_str: str, salt_b64: Optional[str],
+          params: Dict[str, Any]) -> None:
+    try:
+        salt = _b64d(salt_b64) if salt_b64 else os.urandom(16)
+        pw = pass_str.encode("utf-8")
+        if method == "scrypt":
+            n = int(params.get("n", 2**14))
+            r = int(params.get("r", 8))
+            p = int(params.get("p", 1))
+            dk = int(params.get("dk", 32))
+            out = _scrypt(pw, salt, n, r, p, dk)
+            meta = {"method": "scrypt", "n": n, "r": r, "p": p, "dk": dk}
+        else:
+            it = int(params.get("it", 200_000))
+            dk = int(params.get("dk", 32))
+            alg = str(params.get("alg", "sha256"))
+            out = _pbkdf2(pw, salt, it, dk, alg)
+            meta = {"method": "pbkdf2", "it": it, "dk": dk, "alg": alg}
+        res = {"salt": _b64e(salt), "key": _b64e(out), **meta}
+        print(json.dumps(res, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"kdf failed: {e!r}")
+        raise SystemExit(1)
+
+
+def do_pass_store(method: str, pass_str: str) -> None:
+    try:
+        salt = os.urandom(16)
+        if method == "scrypt":
+            n, r, p, dk = 2**14, 8, 1, 32
+            key = _scrypt(pass_str.encode(), salt, n, r, p, dk)
+            rec = {
+                "v": 1, "m": "scrypt", "n": n, "r": r, "p": p, "dk": dk,
+                "salt": _b64e(salt), "key": _b64e(key),
+            }
+        else:
+            it, dk, alg = 200_000, 32, "sha256"
+            key = _pbkdf2(pass_str.encode(), salt, it, dk, alg)
+            rec = {
+                "v": 1, "m": "pbkdf2", "it": it, "dk": dk, "alg": alg,
+                "salt": _b64e(salt), "key": _b64e(key),
+            }
+        print(json.dumps(rec, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"pass_store failed: {e!r}")
+        raise SystemExit(1)
+
+
+def do_pass_verify(rec_json: str, pass_str: str) -> None:
+    try:
+        rec = json.loads(rec_json)
+        salt = _b64d(rec["salt"])
+        if rec["m"] == "scrypt":
+            key = _scrypt(pass_str.encode(), salt,
+                          int(rec["n"]), int(rec["r"]),
+                          int(rec["p"]), int(rec["dk"]))
+        else:
+            key = _pbkdf2(pass_str.encode(), salt,
+                          int(rec["it"]), int(rec["dk"]),
+                          rec.get("alg", "sha256"))
+        ok = hmac.compare_digest(_b64d(rec["key"]), key)
+        print(json.dumps({"ok": ok}, ensure_ascii=False))
+        if not ok:
+            raise SystemExit(2)
+    except Exception as e:
+        log_err(f"pass_verify failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- TOTP (RFC 6238) -------------------------------------------------------
+
+def _base32_pad(s: str) -> str:
+    pad = "=" * ((8 - len(s) % 8) % 8)
+    return s + pad
+
+
+def _totp_key(secret_b32: str) -> bytes:
+    s = secret_b32.strip().replace(" ", "").upper()
+    return base64.b32decode(_base32_pad(s), casefold=True)
+
+
+def _hotp(key: bytes, counter: int, alg: str = "sha1", digits: int = 6
+          ) -> int:
+    cnt = counter.to_bytes(8, "big")
+    mac = hmac.new(key, cnt, getattr(hashlib, alg)).digest()
+    off = mac[-1] & 0x0F
+    bin4 = ((mac[off] & 0x7F) << 24 |
+            (mac[off + 1] & 0xFF) << 16 |
+            (mac[off + 2] & 0xFF) << 8 |
+            (mac[off + 3] & 0xFF))
+    return bin4 % (10 ** digits)
+
+
+def _totp_now(key: bytes, step: int, t0: int,
+              alg: str, digits: int) -> Dict[str, Any]:
+    t = int(time.time())
+    ctr = (t - t0) // step
+    code = _hotp(key, ctr, alg=alg, digits=digits)
+    remain = step - ((t - t0) % step)
+    return {"code": f"{code:0{digits}d}", "sec_left": remain, "ctr": ctr}
+
+
+def do_totp_gen(secret_b32: str, step: int, t0: int,
+                alg: str, digits: int) -> None:
+    try:
+        key = _totp_key(secret_b32)
+        out = _totp_now(key, step, t0, alg, digits)
+        print(json.dumps(out, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"totp_gen failed: {e!r}")
+        raise SystemExit(1)
+
+
+def do_totp_verify(secret_b32: str, code: str, step: int, t0: int,
+                   alg: str, digits: int, drift: int) -> None:
+    try:
+        key = _totp_key(secret_b32)
+        now = int(time.time())
+        ctr = (now - t0) // step
+        ok = False
+        for d in range(-abs(drift), abs(drift) + 1):
+            c = _hotp(key, ctr + d, alg=alg, digits=digits)
+            if f"{c:0{digits}d}" == code:
+                ok = True
+                break
+        print(json.dumps({"ok": ok}, ensure_ascii=False))
+        if not ok:
+            raise SystemExit(2)
+    except Exception as e:
+        log_err(f"totp_verify failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- Secure Archive (integrity only) --------------------------------------
+
+def do_pack(paths: list[str], out_path: str, key_b64: str,
+            alg: str) -> None:
+    try:
+        key = _b64d(key_b64)
+        tmpf = tempfile.NamedTemporaryFile(delete=False)
+        tmpf.close()
+        with tarfile.open(tmpf.name, "w:gz") as tar:
+            for p in paths:
+                tar.add(p, arcname=os.path.basename(p))
+        with open(tmpf.name, "rb") as f:
+            data = f.read()
+        os.unlink(tmpf.name)
+        mac = hmac.new(key, data, getattr(hashlib, alg)).digest()
+        env = {
+            "v": 1,
+            "alg": alg,
+            "hmac": _b64e(mac),
+            "size": len(data),
+            "ts": int(time.time()),
+        }
+        blob = json.dumps(env).encode() + b"\n" + data
+        _write_all(out_path, blob)
+    except Exception as e:
+        log_err(f"pack failed: {e!r}")
+        raise SystemExit(1)
+
+
+def do_unpack(in_path: str, key_b64: str) -> None:
+    try:
+        key = _b64d(key_b64)
+        blob = _read_all(in_path)
+        head, _, data = blob.partition(b"\n")
+        env = json.loads(head.decode("utf-8"))
+        mac = hmac.new(key, data, getattr(hashlib, env["alg"])).digest()
+        if not hmac.compare_digest(_b64d(env["hmac"]), mac):
+            print(json.dumps({"ok": False}, ensure_ascii=False))
+            raise SystemExit(2)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            tar.extractall(".")
+        print(json.dumps({"ok": True}, ensure_ascii=False))
+    except Exception as e:
+        log_err(f"unpack failed: {e!r}")
+        raise SystemExit(1)
+
+
+# --- Parser ----------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="seccli",
+        description="All-in-one security CLI (quantum-ready envelope).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("gen-secret", help="generate random key (b64)")
+    q.add_argument("--nbytes", type=int, default=32)
+    q.set_defaults(func=lambda a: do_gen_secret(a.nbytes))
+
+    q = sub.add_parser("hash", help="hash stdin or file")
+    q.add_argument("--alg", default="sha256")
+    q.add_argument("--path", default=None)
+    q.set_defaults(func=lambda a: do_hash(a.alg, a.path))
+
+    q = sub.add_parser("hmac", help="HMAC of stdin or file")
+    q.add_argument("--alg", default="sha256")
+    q.add_argument("--key", required=True)
+    q.add_argument("--path", default=None)
+    q.set_defaults(func=lambda a: do_hmac(a.alg, a.key, a.path))
+
+    q = sub.add_parser("hmac-verify", help="verify HMAC")
+    q.add_argument("--alg", default="sha256")
+    q.add_argument("--key", required=True)
+    q.add_argument("--sig", required=True)
+    q.add_argument("--path", default=None)
+    q.set_defaults(func=lambda a: do_hmac_verify(a.alg, a.key,
+                                                 a.sig, a.path))
+
+    q = sub.add_parser("kdf", help="derive key from passphrase")
+    q.add_argument("--method", choices=["scrypt", "pbkdf2"],
+                   default="scrypt")
+    q.add_argument("--pass", dest="pw", required=True)
+    q.add_argument("--salt", default=None)
+    q.add_argument("--n", type=int, default=2**14)
+    q.add_argument("--r", type=int, default=8)
+    q.add_argument("--p", type=int, default=1)
+    q.add_argument("--dk", type=int, default=32)
+    q.add_argument("--it", type=int, default=200_000)
+    q.add_argument("--alg", default="sha256")
+    q.set_defaults(func=lambda a: do_kdf(
+        a.method, a.pw, a.salt,
+        {"n": a.n, "r": a.r, "p": a.p, "dk": a.dk,
+         "it": a.it, "alg": a.alg},
+    ))
+
+    q = sub.add_parser("pass-store", help="store password hash (JSON)")
+    q.add_argument("--method", choices=["scrypt", "pbkdf2"],
+                   default="scrypt")
+    q.add_argument("--pass", dest="pw", required=True)
+    q.set_defaults(func=lambda a: do_pass_store(a.method, a.pw))
+
+    q = sub.add_parser("pass-verify", help="verify password hash JSON")
+    q.add_argument("--record", required=True)
+    q.add_argument("--pass", dest="pw", required=True)
+    q.set_defaults(func=lambda a: do_pass_verify(a.record, a.pw))
+
+    q = sub.add_parser("totp-gen", help="TOTP current code")
+    q.add_argument("--secret", required=True)
+    q.add_argument("--step", type=int, default=30)
+    q.add_argument("--t0", type=int, default=0)
+    q.add_argument("--alg", default="sha1")
+    q.add_argument("--digits", type=int, default=6)
+    q.set_defaults(func=lambda a: do_totp_gen(
+        a.secret, a.step, a.t0, a.alg, a.digits))
+
+    q = sub.add_parser("totp-verify", help="verify TOTP code")
+    q.add_argument("--secret", required=True)
+    q.add_argument("--code", required=True)
+    q.add_argument("--step", type=int, default=30)
+    q.add_argument("--t0", type=int, default=0)
+    q.add_argument("--alg", default="sha1")
+    q.add_argument("--digits", type=int, default=6)
+    q.add_argument("--drift", type=int, default=1)
+    q.set_defaults(func=lambda a: do_totp_verify(
+        a.secret, a.code, a.step, a.t0, a.alg, a.digits, a.drift))
+
+    q = sub.add_parser("pack", help="tar.gz + HMAC envelope")
+    q.add_argument("--out", required=True)
+    q.add_argument("--key", required=True)
+    q.add_argument("--alg", default="sha256")
+    q.add_argument("paths", nargs="+")
+    q.set_defaults(func=lambda a: do_pack(a.paths, a.out, a.key, a.alg))
+
+    q = sub.add_parser("unpack", help="verify+extract envelope")
+    q.add_argument("--in", dest="inp", required=True)
+    q.add_argument("--key", required=True)
+    q.set_defaults(func=lambda a: do_unpack(a.inp, a.key))
+
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    try:
+        p = build_parser()
+        ns = p.parse_args(argv)
+        ns.func(ns)
+        return 0
+    except SystemExit as e:
+        return int(e.code)
+    except Exception as e:
+        log_err(f"main failed: {e!r}")
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
