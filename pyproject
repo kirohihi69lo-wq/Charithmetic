@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "charithmetic"
+version = "0.1.0"
+description = "Pure-Python numeric core with CLI + security tools."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "HIROKI" }]
+keywords = ["python", "numeric", "security", "cli", "pure-python"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3 :: Only",
+  "Intended Audience :: Developers",
+]
+
+[project.urls]
+Homepage = "https://github.com/<your-account>/charithmetic"
+Issues = "https://github.com/<your-account>/charithmetic/issues"
+
+[project.scripts]
+charicli = "charithmetic.cli:main"
+seccli   = "charithmetic.seccli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["charithmetic*"]
+
+[tool.setuptools.package-data]
+charithmetic = ["py.typed"]
+
+[tool.distutils.bdist_wheel]
+universal = "0"
