@@ -19,3 +19,5 @@ Another model under development
 
 ```bash
 pip install -e .
+
+[![CodeQL Advanced](https://github.com/kirohihi69lo-wq/Charithmetic/actions/workflows/codeql.yml/badge.svg)](https://github.com/kirohihi69lo-wq/Charithmetic/actions/workflows/codeql.yml)
