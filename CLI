@@ -1,0 +1,222 @@
+# MIT © HIROKI
+# Minimal CLI for numeric tasks. Works w/ or w/o Charithmetic.
+
+from __future__ import annotations
+import sys
+import os
+import math
+import time
+import json
+import random
+import argparse
+from typing import List, Tuple, Any, Optional
+
+ERROR_LOG = "error_log.txt"
+
+
+def log_error(msg: str) -> None:
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.time():.3f}\t{msg}\n")
+    except Exception:
+        pass
+
+
+def try_import_charithmetic():
+    try:
+        import charithmetic as ch  # type: ignore
+        return ch
+    except Exception as e:
+        log_error(f"import charithmetic failed: {e!r}")
+        return None
+
+
+# --- Charithmetic adapters -------------------------------------------------
+
+class _Chx:
+    def __init__(self):
+        self._ch = try_import_charithmetic()
+
+    def has_core(self) -> bool:
+        return self._ch is not None
+
+    def kahan_sum(self, xs: List[float]) -> float:
+        if self._ch:
+            return self._ch.kahan_sum(xs)  # type: ignore[attr-defined]
+        # fallback
+        s = 0.0
+        c = 0.0
+        for x in xs:
+            y = x - c
+            t = s + y
+            c = (t - s) - y
+            s = t
+        return s
+
+    def mean(self, xs: List[float]) -> float:
+        if self._ch and hasattr(self._ch, "mean_pairwise"):
+            return self._ch.mean_pairwise(xs)  # type: ignore
+        n = len(xs) or 1
+        return self.kahan_sum(xs) / n
+
+    def vec(self, xs: Any) -> List[float]:
+        if self._ch and hasattr(self._ch, "vec"):
+            return list(self._ch.vec(xs))  # type: ignore
+        return list(float(v) for v in xs)
+
+
+CHX = _Chx()
+
+
+# --- Utils -----------------------------------------------------------------
+
+def parse_numbers(seq: List[str]) -> List[float]:
+    out: List[float] = []
+    for s in seq:
+        try:
+            out.append(float(s))
+        except Exception as e:
+            log_error(f"parse num failed: {s!r} {e!r}")
+            raise SystemExit(f"invalid number: {s!r}")
+    return out
+
+
+def now_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+def bench_once(fn, *args, repeat: int = 1) -> Tuple[float, Any]:
+    best = float("inf")
+    last = None
+    for _ in range(max(1, repeat)):
+        t0 = now_ms()
+        last = fn(*args)
+        t1 = now_ms()
+        dt = t1 - t0
+        if dt < best:
+            best = dt
+    return best, last
+
+
+# --- Commands --------------------------------------------------------------
+
+def cmd_sum(args: argparse.Namespace) -> None:
+    xs = parse_numbers(args.numbers)
+    v = CHX.kahan_sum(xs)
+    print(json.dumps({"sum": v}, ensure_ascii=False))
+
+
+def cmd_mean(args: argparse.Namespace) -> None:
+    xs = parse_numbers(args.numbers)
+    v = CHX.mean(xs)
+    print(json.dumps({"mean": v}, ensure_ascii=False))
+
+
+def cmd_rand(args: argparse.Namespace) -> None:
+    n = max(1, args.n)
+    seed = args.seed if args.seed is not None else 2025
+    random.seed(seed)
+    xs = [random.random() for _ in range(n)]
+    if args.op == "sum":
+        v = CHX.kahan_sum(xs)
+        print(json.dumps({"n": n, "sum": v}, ensure_ascii=False))
+    elif args.op == "mean":
+        v = CHX.mean(xs)
+        print(json.dumps({"n": n, "mean": v}, ensure_ascii=False))
+    else:
+        raise SystemExit("op must be sum|mean")
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    n = max(1, args.n)
+    rep = max(1, args.repeat)
+    seed = args.seed if args.seed is not None else 2025
+    random.seed(seed)
+    xs = [random.random() for _ in range(n)]
+    fn = CHX.kahan_sum if args.op == "sum" else CHX.mean
+    t_ms, v = bench_once(fn, xs, repeat=rep)
+    out = {
+        "op": args.op,
+        "n": n,
+        "repeat": rep,
+        "ms_best": round(t_ms, 6),
+        "result": v,
+        "charithmetic": CHX.has_core(),
+    }
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_info(_args: argparse.Namespace) -> None:
+    info = {
+        "py": sys.version.split()[0],
+        "platform": sys.platform,
+        "charithmetic": CHX.has_core(),
+        "cwd": os.getcwd(),
+    }
+    print(json.dumps(info, ensure_ascii=False))
+
+
+def cmd_check(_args: argparse.Namespace) -> None:
+    xs = [1e-10] * 10_000 + [1.0]
+    naive = sum(xs)
+    kahan = CHX.kahan_sum(xs)
+    ok = abs(naive - kahan) < 1e-9
+    out = {"ok": ok, "naive": naive, "kahan": kahan}
+    print(json.dumps(out, ensure_ascii=False))
+
+
+# --- Parser ----------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="charicli",
+        description="Pure-Python numeric CLI (Charithmetic ready).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    q = sub.add_parser("sum", help="sum numbers")
+    q.add_argument("numbers", nargs="+")
+    q.set_defaults(func=cmd_sum)
+
+    q = sub.add_parser("mean", help="mean of numbers")
+    q.add_argument("numbers", nargs="+")
+    q.set_defaults(func=cmd_mean)
+
+    q = sub.add_parser("rand", help="rand vec then sum|mean")
+    q.add_argument("--n", type=int, default=1_000_000)
+    q.add_argument("--op", choices=["sum", "mean"], default="sum")
+    q.add_argument("--seed", type=int, default=None)
+    q.set_defaults(func=cmd_rand)
+
+    q = sub.add_parser("bench", help="bench sum|mean")
+    q.add_argument("--n", type=int, default=1_000_000)
+    q.add_argument("--repeat", type=int, default=5)
+    q.add_argument("--op", choices=["sum", "mean"], default="sum")
+    q.add_argument("--seed", type=int, default=None)
+    q.set_defaults(func=cmd_bench)
+
+    q = sub.add_parser("info", help="env info")
+    q.set_defaults(func=cmd_info)
+
+    q = sub.add_parser("check", help="precision self-check")
+    q.set_defaults(func=cmd_check)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        parser = build_parser()
+        ns = parser.parse_args(argv)
+        ns.func(ns)
+        return 0
+    except SystemExit as e:
+        return int(e.code)
+    except Exception as e:
+        log_error(f"main failed: {e!r}")
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
