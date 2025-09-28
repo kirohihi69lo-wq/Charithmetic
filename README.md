@@ -1,5 +1,5 @@
 # Charithmetic
-Initial prototype of a numerical computation model under development
+Initial prototype of the numerical computation functionality under development
 
 # Charithmetic (Pure-Python Numeric Core + Tools)
 
