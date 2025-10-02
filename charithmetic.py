@@ -7,7 +7,60 @@
 # -*- coding: utf-8 -*-
 
 """
-Pure Python arithmetic core with adaptive precision,
+Charithmetic - Pure Python Numeric Computation Engine
+
+A lightweight, pure-Python numeric computation system designed for edge/mobile
+devices with adaptive optimization and zero external dependencies.
+
+Architecture Overview
+---------------------
+The system is organized into several key subsystems:
+
+1. **Loop Runtime System** (ForRuntime, EachPlan, CountPlan, ChunkPlan)
+   - JIT compilation via AST parsing and eval()
+   - AOT caching to persistent SQLite storage
+   - Two-phase execution: Header → Plan → Tailer
+
+2. **Memory Management** (SonicBuffer)
+   - Ring buffer with hot/cold policy
+   - Fixed-size slots for predictable memory usage
+   - Zero-copy memoryview operations
+
+3. **Adaptive Optimization** (DeltaGate, delta_gate decorator)
+   - Hot-path detection via 3-hit threshold
+   - Progressive optimization through tiers (T0→T3)
+   - Warmup cache for pre-computed plans
+
+4. **Caching System** (PICCache)
+   - Polymorphic Inline Cache for compiled functions
+   - 3-tier validation: function → AST → CRC32
+   - Shape-specialized for consistent performance
+
+5. **Parallel Execution** (BigParallelWorker)
+   - Automatic parallelization for large operations
+   - Process/thread pool based on operation type
+   - Tiled algorithms for cache efficiency
+
+6. **Metrics & Policy** (SonicMeter, TailPolicy)
+   - JSONL logging for offline analysis
+   - EMA-based latency tracking
+   - Adaptive SLA selection (fast/balanced/precise)
+
+Performance Characteristics
+---------------------------
+- Pure Python - no C extensions or external libraries
+- GC disabled for large operations (>256KB)
+- Memory pools reduce allocation overhead
+- Cache-friendly access patterns (tiling, row-major)
+- Zero-copy operations via memoryview
+
+Key Design Principles
+---------------------
+1. Minimize allocations - reuse buffers via pooling
+2. Progressive optimization - pay cost only when hot
+3. Fail-safe caching - corrupt entries silently ignored
+4. Predictable performance - fixed-size buffers, bounded loops
+5. Observable - comprehensive metrics and logging
 """
 
 from __future__ import annotations
@@ -294,50 +347,95 @@ class SonicBuffer:
         self.mass = "plateau"
 
     def _step(self) -> int:
+        """Advance ring buffer head pointer (circular).
+        
+        Returns current index before advancing to next position.
+        """
         i = self.head
-        self.head = (self.head + 1) % self.slot
+        self.head = (self.head + 1) % self.slot  # Wrap around at end
         return i
 
     def _evict(self) -> None:
+        """Evict oldest entry when buffer is full.
+        
+        Follows FIFO policy: removes entry at head position.
+        Updates hot cache and accounting.
+        """
         if self.live < self.slot:
-            return
+            return  # Still have free slots
         i = self._step()
         mv = self.ring[i]
         sid = self.ids[i]
         if mv is not None:
-            self.bytes_now -= len(mv)
+            self.bytes_now -= len(mv)  # Track memory usage
         if sid in self.hot:
-            del self.hot[sid]
+            del self.hot[sid]  # Remove from hot cache
         self.ring[i] = None
         self.ids[i] = 0
         self.live -= 1
-        self.miss += 1
+        self.miss += 1  # Count eviction as cache miss
 
     def alloc_slot(self, data: bytes) -> int:
+        """Allocate new slot and copy data into ring buffer.
+        
+        Creates slot with fixed size, copies data, and adds to hot cache.
+        Evicts oldest entry if buffer is full.
+        
+        Parameters
+        ----------
+        data : bytes
+            Data to store (must fit in slot_bytes)
+            
+        Returns
+        -------
+        int
+            Slot ID for later retrieval
+            
+        Raises
+        ------
+        VisibleError
+            If data exceeds slot size
+        """
         if len(data) > self.size:
-            raise VisibleError("oversize")
-        self._evict()
-        i = self._step()
+            raise VisibleError(f"Data size {len(data)} exceeds slot size {self.size}")
+        self._evict()  # Make room if needed
+        i = self._step()  # Get next slot index
+        # Allocate fixed-size buffer for predictable memory usage
         buf = bytearray(self.size)
         mv = memoryview(buf)
-        mv[: len(data)] = data
+        mv[: len(data)] = data  # Zero-copy write
+        # Assign unique ID and track
         sid = self.tick
         self.tick += 1
         self.ring[i] = mv
         self.ids[i] = sid
-        self.hot[sid] = mv
+        self.hot[sid] = mv  # Add to hot cache for O(1) lookup
         self.live += 1
         self.bytes_now += len(mv)
         return sid
 
     def hot_fill(self, sid: int, data: bytes) -> None:
+        """Update data in hot cache (fast path for frequent updates).
+        
+        Parameters
+        ----------
+        sid : int
+            Slot ID from alloc_slot
+        data : bytes
+            New data to write
+            
+        Raises
+        ------
+        VisibleError
+            If sid not in hot cache or data too large
+        """
         mv = self.hot.get(sid)
         if mv is None:
-            raise VisibleError("sid invalid")
+            raise VisibleError(f"Slot ID {sid} not found in hot cache")
         if len(data) > len(mv):
-            raise VisibleError("oversize")
-        mv[: len(data)] = data
-        self.hits += 1
+            raise VisibleError(f"Data size {len(data)} exceeds slot capacity {len(mv)}")
+        mv[: len(data)] = data  # In-place update (zero-copy)
+        self.hits += 1  # Track cache hit
 
     def get(self, sid: int) -> Optional[memoryview]:
         return self.hot.get(sid)
@@ -350,26 +448,52 @@ class SonicBuffer:
             break
 
     def mass_adjust(self) -> None:
+        """Adjust buffer mass profile based on utilization.
+        
+        Classifies buffer state into three categories:
+        - burst: >80% full - high memory pressure
+        - plateau: 20-80% full - normal operation
+        - long_tail: <20% full - underutilized
+        
+        Used to tune allocation and eviction policies.
+        """
         cap = self.slot * self.size
-        r = 0.0 if cap == 0 else self.bytes_now / cap
+        r = 0.0 if cap == 0 else self.bytes_now / cap  # Utilization ratio
         if r > 0.8:
-            self.mass = "burst"
+            self.mass = "burst"  # High pressure - consider aggressive eviction
         elif r < 0.2:
-            self.mass = "long_tail"
+            self.mass = "long_tail"  # Low usage - can be more conservative
         else:
-            self.mass = "plateau"
+            self.mass = "plateau"  # Normal operation
 
     def sonic_prewarm(self) -> None:
-        rnd = random.Random(31)
+        """Pre-warm buffer with sample data for various sizes.
+        
+        Allocates slots with representative data patterns to:
+        1. Pre-allocate memory to avoid allocation delays
+        2. Warm up cache structures
+        3. Establish baseline for size-based routing
+        
+        Uses deterministic random seed (31) for reproducibility.
+        Tests three size classes: small (100), medium (10K), large (1M).
+        """
+        rnd = random.Random(31)  # Deterministic for consistent warmup
         for n in (100, 10_000, 1_000_000):
-            k = min(self.size // 8, n)
+            k = min(self.size // 8, n)  # Fit within slot, assuming 8 bytes/value
             vals = [rnd.random() for _ in range(k)]
             buf = bytearray(self.size)
             mv = memoryview(buf)
-            struct.pack_into(f"{k}d", mv, 0, *vals)
-            _ = self.alloc_slot(mv.tobytes())
+            struct.pack_into(f"{k}d", mv, 0, *vals)  # Pack as doubles
+            _ = self.alloc_slot(mv.tobytes())  # Allocate and discard ID
 
     def snapshot(self) -> Dict[str, float]:
+        """Get current buffer statistics.
+        
+        Returns
+        -------
+        Dict[str, float]
+            Current metrics: bytes, hits, miss, slots
+        """
         return {
             "bytes": float(self.bytes_now),
             "hits": float(self.hits),
@@ -634,21 +758,41 @@ class SonicMeter:
         return ys[k]
 
     def feed(self, tag: str, ms: float) -> None:
+        """Record timing sample and write metrics to JSONL log.
+        
+        Maintains sliding window of recent measurements and computes:
+        - p50 (median) latency
+        - p95 percentile latency  
+        - QPS (queries per second)
+        
+        Parameters
+        ----------
+        tag : str
+            Operation identifier
+        ms : float
+            Elapsed time in milliseconds
+            
+        Notes
+        -----
+        - Window size: 256 samples
+        - Metrics written to JSONL for offline analysis
+        - P95 computed via sorted array (acceptable for 256 samples)
+        """
         self.hist.append(ms)
         if len(self.hist) > 256:
-            self.hist.pop(0)
+            self.hist.pop(0)  # Maintain fixed window size
         now = _now_ms()
-        dt = max(1.0, now - self.last_ts)
-        qps = len(self.hist) * 1_000.0 / dt
+        dt = max(1.0, now - self.last_ts)  # Avoid division by zero
+        qps = len(self.hist) * 1_000.0 / dt  # Convert to per-second rate
         rec = {
             "tag": tag,
-            "p50_ms": float(self.hist[len(self.hist) // 2]),
+            "p50_ms": float(self.hist[len(self.hist) // 2]),  # Median (assumes sorted elsewhere)
             "p95_ms": float(self._p95(self.hist)),
             "qps": float(qps),
             "n": len(self.hist),
         }
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(rec) + "\n")  # JSONL format - one JSON per line
         self.last_ts = now
 
 
@@ -657,7 +801,24 @@ class SonicMeter:
 
 @dataclass
 class TailPolicy:
-    """Latency policy with p50/p95 EMA."""
+    """Latency policy with Exponential Moving Average (EMA) tracking.
+    
+    Tracks p50 and p95 latencies using EMA for smooth adaptation.
+    Also monitors JIT hit ratio and I/O hiding effectiveness.
+    
+    Attributes
+    ----------
+    a : float
+        EMA smoothing factor (0.1 = 10% new, 90% old)
+    p50 : float
+        Current p50 latency estimate
+    p95 : float
+        Current p95 latency estimate
+    jit_hit_ratio : float
+        JIT cache hit rate
+    io_hide_ratio : float
+        I/O hiding effectiveness
+    """
 
     a: float = 0.1
     p50: float = 0.0
@@ -1534,23 +1695,50 @@ class ForRuntime:
 
 
 def delta_gate(func):
+    """Decorator for adaptive tier-based optimization.
+    
+    Wraps methods to enable progressive optimization through tiers:
+    - Tier 0: Cold path - first invocation
+    - Tier 1-2: Warming - building statistics
+    - Tier 3: Hot path - fully optimized
+    
+    Features:
+    - Automatic tier progression based on access patterns
+    - Execution plan injection from warmup cache
+    - Metrics logging for performance analysis
+    - Error tracking for diagnostics
+    
+    The decorator checks for delta_key, gear_state, and warmup_cache
+    attributes on the instance to enable tiered execution.
+    
+    Returns
+    -------
+    Callable
+        Wrapped function with tier management
+    """
     def wrapper(self, *a, **k):
         try:
+            # Check if instance supports delta gating
             if (
                 hasattr(self, "delta_key")
                 and hasattr(self, "gear_state")
                 and hasattr(self, "warmup_cache")
             ):
+                # Generate routing key from first argument
                 key = self.delta_key(a[0] if a else None)
                 tier_idx = self.gear_state[key]
+                # Advance tier if warmup cache has plan
                 if tier_idx < 3:
                     self.gear_state[key] += 1 if self.warmup_cache.get(key) else 0
+                # Inject execution plan and tier info
                 plan = self.warmup_cache.get(key, {})
                 k = {**k, "tier": f"T{tier_idx}", "plan": plan}
+                # Log successful invocation
                 if hasattr(self, "metrics_log"):
                     self.metrics_log.append({"hit": 1, "tier": tier_idx})
             return func(self, *a, **k)
         except Exception as e:
+            # Log errors for diagnostics
             if hasattr(self, "metrics_log"):
                 self.metrics_log.append({"hit": 0, "error": str(e)})
             raise
