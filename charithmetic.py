@@ -1801,9 +1801,53 @@ class CoreAllAdaptiveCS:
 
     @delta_gate
     def sum_kahan(self, seq: List[float], tier: str = "T0", plan: Dict = None) -> float:
+        """Kahan compensated summation for improved numerical accuracy.
+        
+        Tracks and compensates for floating-point rounding errors to provide
+        more accurate sums than naive addition, especially for large sequences.
+        
+        Parameters
+        ----------
+        seq : List[float]
+            Sequence of numbers to sum
+        tier : str, default="T0"
+            Optimization tier (T0-T3)
+        plan : Dict, optional
+            Execution plan metadata
+            
+        Returns
+        -------
+        float
+            Compensated sum with reduced rounding error
+            
+        Algorithm
+        ---------
+        Uses Kahan's compensated summation algorithm:
+        1. Track running sum and compensation
+        2. For each value, compute corrected delta
+        3. Update sum and adjust compensation
+        
+        Performance
+        -----------
+        - O(n) time complexity
+        - Minimal memory overhead (2 accumulators)
+        - ~2x operations vs naive sum, but much more accurate
+        
+        References
+        ----------
+        Kahan, W. (1965). "Further remarks on reducing truncation errors"
+        
+        Examples
+        --------
+        >>> core.sum_kahan([1.0, 1e100, 1.0, -1e100])
+        2.0  # Accurate result
+        >>> sum([1.0, 1e100, 1.0, -1e100])
+        0.0  # Naive sum loses precision
+        """
         s, c = 0.0, 0.0
         for y in seq:
             t = s + y
+            # Compensate for lost low-order bits
             c += (s - t) + y if abs(s) >= abs(y) else (y - t) + s
             s = t
         return s + c
@@ -1958,6 +2002,51 @@ class CoreAllAdaptiveCS:
         tier: str = "T0",
         plan: Dict = None,
     ) -> List[int]:
+        """Number Theoretic Transform convolution (modular arithmetic).
+        
+        Computes discrete convolution using modular arithmetic to avoid
+        floating-point precision issues. Suitable for exact integer computations.
+        
+        Parameters
+        ----------
+        a : List[int]
+            First input sequence
+        b : List[int]
+            Second input sequence
+        mod : int, default=998244353
+            Prime modulus for NTT (must be prime, default is NTT-friendly)
+        tier : str, default="T0"
+            Optimization tier
+        plan : Dict, optional
+            Execution plan metadata
+            
+        Returns
+        -------
+        List[int]
+            Convolution result in modular arithmetic
+            
+        Algorithm
+        ---------
+        Uses naive O(n*m) convolution in modular arithmetic:
+        - For each output position: sum products of overlapping elements
+        - All operations performed mod p for exact integer results
+        
+        Performance
+        -----------
+        - Time: O(len(a) * len(b))
+        - Space: O(len(a) + len(b) - 1)
+        - No floating-point errors
+        
+        Notes
+        -----
+        For large sequences, consider FFT-based convolution.
+        Default modulus 998244353 = 119 * 2^23 + 1 is NTT-friendly.
+        
+        Examples
+        --------
+        >>> core.ntt_conv([1, 2, 3], [4, 5], mod=998244353)
+        [4, 13, 22, 15]
+        """
         n = len(a) + len(b) - 1
         res = [0] * n
         for i in range(len(a)):
@@ -11733,6 +11822,54 @@ def _dft(x, inverse=False):
 
 
 class BigParallelWorker:
+    """Parallel execution engine for large-scale numeric operations.
+    
+    Provides automatic parallelization for operations exceeding size thresholds.
+    Uses process or thread pools based on configuration and operation type.
+    
+    Parameters
+    ----------
+    matmul_min : int, default=256
+        Minimum matrix dimension for parallel matmul
+    generic_min : int, default=10**6
+        Minimum size for parallel generic operations
+    max_workers : Optional[int], default=None
+        Worker pool size (defaults to CPU count)
+    use_process : bool, default=True
+        Use ProcessPoolExecutor vs ThreadPoolExecutor
+    symbolic : Optional[Callable], default=None
+        Symbolic math hook for expression evaluation
+    quantize : Optional[Callable], default=None
+        Quantization hook for data compression
+    fft_fn : Optional[Callable], default=None
+        External FFT implementation
+    ifft_fn : Optional[Callable], default=None
+        External inverse FFT implementation
+    conv_fn : Optional[Callable], default=None
+        External convolution implementation
+        
+    Attributes
+    ----------
+    matmul_min : int
+        Threshold for parallel matrix multiplication
+    generic_min : int
+        Threshold for parallel operations
+    max_workers : int
+        Number of parallel workers
+        
+    Performance Notes
+    -----------------
+    - Process pool for CPU-bound operations (default)
+    - Thread pool available for I/O-bound operations
+    - Automatic chunking based on target size (256KB)
+    - Hooks for specialized implementations (FFT, symbolic, etc.)
+    
+    Examples
+    --------
+    >>> worker = BigParallelWorker(matmul_min=256, generic_min=10**6)
+    >>> result = worker.sum(list(range(10**6)))  # Parallel sum
+    >>> worker.matmul(A, B)  # Parallel matrix multiply
+    """
     def __init__(
         self,
         *,
@@ -11757,6 +11894,13 @@ class BigParallelWorker:
         self.conv_fn = conv_fn
 
     def _pool(self):
+        """Create executor pool (process or thread based).
+        
+        Returns
+        -------
+        Executor
+            ProcessPoolExecutor or ThreadPoolExecutor
+        """
         return (
             ProcessPoolExecutor(self.max_workers)
             if self.use_process
@@ -11764,14 +11908,58 @@ class BigParallelWorker:
         )
 
     def _parts(self, n, target=1 << 18):
+        """Partition range into chunks for parallel processing.
+        
+        Parameters
+        ----------
+        n : int
+            Total size to partition
+        target : int, default=262144
+            Target chunk size (256KB)
+            
+        Returns
+        -------
+        List[Tuple[int, int]]
+            List of (start, end) index pairs
+            
+        Notes
+        -----
+        Ensures balanced chunks with last chunk handling remainder.
+        """
         m = max(1, (n + target - 1) // target)
         step = (n + m - 1) // m
         return [(i, min(i + step, n)) for i in range(0, n, step)]
 
     def _maybe_q(self, data):
+        """Apply quantization if hook available.
+        
+        Parameters
+        ----------
+        data : Any
+            Data to potentially quantize
+            
+        Returns
+        -------
+        Any
+            Quantized data or original if no hook
+        """
         return self.quantize(data) if self.quantize else data
 
     def _maybe_sym(self, expr, ctx):
+        """Apply symbolic evaluation if hook available.
+        
+        Parameters
+        ----------
+        expr : str
+            Expression to evaluate
+        ctx : dict
+            Evaluation context
+            
+        Returns
+        -------
+        Any
+            Evaluated result or None if no hook
+        """
         return self.symbolic(expr, ctx) if self.symbolic else None
 
     # --- ops ---
@@ -11866,24 +12054,79 @@ class BigParallelWorker:
             return sum(f.result() for f in as_completed(fs))
 
     def matmul(self, A, B, *, tile=64):
+        """Parallel tiled matrix multiplication (GEMM).
+        
+        Computes C = A @ B using blocked/tiled algorithm with parallel execution
+        for large matrices. Falls back to serial for small matrices.
+        
+        Parameters
+        ----------
+        A : List[List[float]]
+            Left matrix of shape (n, k)
+        B : List[List[float]]
+            Right matrix of shape (k, p)
+        tile : int, default=64
+            Tile size for cache blocking
+            
+        Returns
+        -------
+        List[List[float]]
+            Result matrix C of shape (n, p)
+            
+        Raises
+        ------
+        ValueError
+            If matrix dimensions don't match (A.cols != B.rows)
+            
+        Algorithm
+        ---------
+        1. For small matrices: row-major order with column caching
+        2. For large matrices: tiled/blocked parallel execution
+           - Divide into tiles for cache efficiency
+           - Process tiles in parallel
+           - Accumulate results with proper synchronization
+        
+        Performance
+        -----------
+        - Serial: O(n*k*p) with cache-friendly access pattern
+        - Parallel: O(n*k*p / workers) with tile size tuning
+        - Tile size affects cache hit rate (default 64 is good for L1)
+        - Process pool avoids GIL for CPU-bound computation
+        
+        Optimization Notes
+        ------------------
+        - Row caching reduces list lookups
+        - Inner loop hoisted multiplication (aik)
+        - Tiles sized for L1 cache (64x64 @ 8 bytes = 32KB)
+        - Parallel submission overlaps computation
+        
+        Examples
+        --------
+        >>> A = [[1, 2], [3, 4]]
+        >>> B = [[5, 6], [7, 8]]
+        >>> worker.matmul(A, B)
+        [[19, 22], [43, 50]]
+        """
         n = len(A)
         k = len(A[0]) if n else 0
         p = len(B[0]) if B else 0
         if n == 0 or k == 0 or p == 0:
             return []
         if k != len(B):
-            raise ValueError("shape mismatch")
+            raise ValueError(f"Matrix dimension mismatch: A is {n}x{k}, B is {len(B)}x{p}")
+        # Serial execution for small matrices
         if max(n, k, p) < self.matmul_min:
             C = [[0.0] * p for _ in range(n)]
             for i in range(n):
-                Ai = A[i]
+                Ai = A[i]  # Cache row for faster access
                 Ci = C[i]
                 for kk in range(k):
-                    aik = Ai[kk]
+                    aik = Ai[kk]  # Hoist multiplication
                     Bk = B[kk]
                     for j in range(p):
                         Ci[j] += aik * Bk[j]
             return C
+        # Parallel tiled execution for large matrices
         t = tile
         out = [[0.0] * p for _ in range(n)]
         tasks = []
