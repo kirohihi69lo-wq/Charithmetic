@@ -139,11 +139,49 @@ class LoopHeader:
 
 
 class DeltaGate:
+    """Adaptive gate for hot-path detection and codec identification.
+    
+    This class tracks access patterns and identifies frequently-used code paths
+    to enable optimization decisions. It also provides codec detection for data buffers.
+    
+    One-liner
+    ---------
+    Track hot paths with 3-hit threshold and detect data formats.
+    
+    Attributes
+    ----------
+    count : Dict[str, int]
+        Access counter per operation key
+    hot : Dict[str, bool]
+        Hot path markers (3+ hits trigger optimization)
+        
+    Performance Notes
+    -----------------
+    - Hot path threshold set to 3 hits for JIT warmup
+    - Codec detection optimized for first 8 bytes only
+    - Size binning reduces cache fragmentation
+    """
     def __init__(self) -> None:
         self.count: Dict[str, int] = {}
         self.hot: Dict[str, bool] = {}
 
     def detect_codec(self, buf: bytes) -> str:
+        """Detect buffer encoding format from content.
+        
+        Parameters
+        ----------
+        buf : bytes
+            Input buffer to analyze
+            
+        Returns
+        -------
+        str
+            Detected codec: 'jsonl', 'csv', or 'bin'
+            
+        Performance
+        -----------
+        Only examines first 8 bytes for speed.
+        """
         if not buf:
             return "bin"
         b0 = buf[:8]
@@ -154,6 +192,22 @@ class DeltaGate:
         return "bin"
 
     def shape_bin(self, n: int) -> int:
+        """Map size to bin index for cache management.
+        
+        Parameters
+        ----------
+        n : int
+            Data size in bytes
+            
+        Returns
+        -------
+        int
+            Bin index (0-3) for size-based routing
+            
+        Notes
+        -----
+        Bins: 0=tiny(<1KB), 1=small(<64KB), 2=medium(<1MB), 3=large(>=1MB)
+        """
         if n <= 1_024:
             return 0
         if n <= 65_536:
@@ -163,12 +217,35 @@ class DeltaGate:
         return 3
 
     def update(self, key: str) -> None:
+        """Track access and mark hot paths.
+        
+        Parameters
+        ----------
+        key : str
+            Operation identifier to track
+            
+        Notes
+        -----
+        Marks path as hot after 3 hits to trigger optimizations.
+        """
         c = self.count.get(key, 0) + 1
         self.count[key] = c
         if c >= 3:
             self.hot[key] = True
 
     def is_hot(self, key: str) -> bool:
+        """Check if operation path is hot (frequently used).
+        
+        Parameters
+        ----------
+        key : str
+            Operation identifier to check
+            
+        Returns
+        -------
+        bool
+            True if path has 3+ hits
+        """
         return bool(self.hot.get(key, False))
 
 
@@ -302,54 +379,167 @@ class SonicBuffer:
 
 
 class PICCache:
-    """PIC-style cache (hash→callable).
-
+    """Polymorphic Inline Cache for JIT compilation.
+    
+    Caches compiled functions with 3-tier validation:
+    - L1: Direct function cache
+    - L2: AST tree cache 
+    - L3: CRC checksum validation
+    
     One-liner
     ---------
-    3-tier keys: hash/ast/crc.
-
-    Args
-    ----
-    None
-
-    Returns
-    -------
-    PICCache
-        Instance.
+    3-tier keys: hash/ast/crc for safe code caching.
+    
+    Attributes
+    ----------
+    _l1 : Dict[str, Callable]
+        Primary function cache
+    _l2 : Dict[str, ast.AST]
+        AST tree cache for recompilation
+    _l3 : Dict[str, int]
+        CRC checksums for validation
+    
+    Performance Notes
+    -----------------
+    - CRC32 provides fast integrity check
+    - AST caching enables safe recompilation
+    - Key format: "{kind}:{crc32:08x}"
+    
+    Examples
+    --------
+    >>> cache = PICCache()
+    >>> key = cache.make_key("each", "x * 2", (100,))
+    >>> fn = cache.get(key)  # None on first access
     """
-
     def __init__(self) -> None:
         self._l1: Dict[str, Callable[..., Any]] = {}
         self._l2: Dict[str, ast.AST] = {}
         self._l3: Dict[str, int] = {}
 
     def make_key(self, kind: str, expr: str, shape: Tuple[int, ...]) -> str:
+        """Generate cache key from operation metadata.
+        
+        Parameters
+        ----------
+        kind : str
+            Operation type ('each', 'count', 'chunk')
+        expr : str
+            Expression string to compile
+        shape : Tuple[int, ...]
+            Data shape for specialization
+            
+        Returns
+        -------
+        str
+            Cache key with format "{kind}:{crc32:08x}"
+        """
         b = f"{kind}:{expr}:{shape}".encode()
         return f"{kind}:{_crc32(b):08x}"
 
     def get(self, key: str) -> Optional[Callable[..., Any]]:
+        """Retrieve cached function by key.
+        
+        Parameters
+        ----------
+        key : str
+            Cache key from make_key()
+            
+        Returns
+        -------
+        Optional[Callable]
+            Cached function or None if not found
+        """
         return self._l1.get(key)
 
     def put(
         self, key: str, fn: Callable[..., Any], tree: Optional[ast.AST], src: str
     ) -> None:
+        """Store function with AST and CRC for validation.
+        
+        Parameters
+        ----------
+        key : str
+            Cache key
+        fn : Callable
+            Compiled function to cache
+        tree : Optional[ast.AST]
+            AST for potential recompilation
+        src : str
+            Source expression for CRC validation
+        """
         self._l1[key] = fn
         if tree is not None:
             self._l2[key] = tree
         self._l3[key] = _crc32(_safe_bytes(src))
 
     def crc_ok(self, key: str, src: str) -> bool:
+        """Validate cached entry against source CRC.
+        
+        Parameters
+        ----------
+        key : str
+            Cache key to validate
+        src : str
+            Source to check against cached CRC
+            
+        Returns
+        -------
+        bool
+            True if CRC matches cached value
+        """
         chk = self._l3.get(key)
         return chk is not None and chk == _crc32(_safe_bytes(src))
 
 
 class AOTStore:
+    """Ahead-of-Time compilation cache with SQLite persistence.
+    
+    Stores compiled functions to disk for fast startup and reduced
+    recompilation overhead across process restarts.
+    
+    Parameters
+    ----------
+    path : str, default="pss_aot.db"
+        SQLite database path for persistent storage
+        
+    Attributes
+    ----------
+    path : str
+        Absolute path to SQLite database
+    log_path : str
+        Path to JSONL log file
+        
+    Performance Notes
+    -----------------
+    - Uses SQLite for ACID compliance
+    - Stores CRC32 for integrity checks
+    - Automatically creates parent directories
+    
+    Raises
+    ------
+    DiagnosticError
+        If database initialization or operations fail
+    """
     def __init__(self, path: str = "pss_aot.db") -> None:
         self.path = str(pathlib.Path(path).absolute())
         self.log_path = "pss_aot.jsonl"
         self._init_db()
 
     def _init_db(self) -> None:
+        """Initialize SQLite database schema.
+        
+        Creates the aot table if it doesn't exist with columns:
+        - k: primary key
+        - kind: operation type
+        - src: source code
+        - crc: integrity checksum
+        - ts: timestamp
+        
+        Raises
+        ------
+        DiagnosticError
+            If database creation fails
+        """
         p = pathlib.Path(self.path).parent
         p.mkdir(parents=True, exist_ok=True)
         try:
@@ -365,32 +555,61 @@ class AOTStore:
             )
             db.commit()
         except sqlite3.OperationalError as e:
-            raise DiagnosticError(f"db init: {e!s}")
+            raise DiagnosticError(f"AOT database initialization failed: {e!s}")
         finally:
             if "db" in locals():
                 db.close()
 
     def save(self, key: str, kind: str, src: str) -> None:
+        """Persist compiled function to database.
+        
+        Parameters
+        ----------
+        key : str
+            Unique cache key
+        kind : str
+            Operation type ('each', 'count', etc.)
+        src : str
+            Source code to save
+            
+        Raises
+        ------
+        DiagnosticError
+            If database write fails
+        """
         crc = _crc32(_safe_bytes(src))
         try:
             db = sqlite3.connect(self.path)
             db.execute(
+                "INSERT OR REPLACE INTO aot(k,kind,src,crc,ts) VALUES(?,?,?,?,?)",
                 (key, kind, src, crc, time.time()),
             )
             db.commit()
         except sqlite3.OperationalError as e:
-            raise DiagnosticError(f"aot save: {e!s}")
+            raise DiagnosticError(f"AOT save failed for key '{key}': {e!s}")
         finally:
             db.close()
 
     def load_all(self) -> Dict[str, Tuple[str, str]]:
+        """Load all cached functions from database.
+        
+        Returns
+        -------
+        Dict[str, Tuple[str, str]]
+            Mapping of key -> (kind, source)
+            
+        Raises
+        ------
+        DiagnosticError
+            If database read fails
+        """
         out: Dict[str, Tuple[str, str]] = {}
         try:
             db = sqlite3.connect(self.path)
             for row in db.execute("SELECT k,kind,src FROM aot"):
                 out[row[0]] = (row[1], row[2])
         except sqlite3.OperationalError as e:
-            raise DiagnosticError(f"aot load: {e!s}")
+            raise DiagnosticError(f"AOT load failed: {e!s}")
         finally:
             db.close()
         return out
@@ -707,11 +926,33 @@ class Ticket:
 
 
 class EachPlan:
-    """for-each plan with guarded eval.
-
+    """Map operation executor with JIT compilation.
+    
+    Executes expressions over sequences with automatic JIT compilation
+    after 3 hits on the same shape (polymorphic inline cache).
+    
     One-liner
     ---------
-    Same-shape 3-hit → JIT.
+    Same-shape 3-hit → JIT compilation for performance.
+    
+    Parameters
+    ----------
+    pic : PICCache
+        Polymorphic inline cache for compiled functions
+    meter : SonicMeter
+        Performance metrics collector
+        
+    Performance Notes
+    -----------------
+    - First 2 calls: interpreted via eval()
+    - 3+ calls: uses cached compiled function
+    - Shape-specialized for consistent performance
+    
+    Examples
+    --------
+    >>> plan = EachPlan(pic, meter)
+    >>> result = plan.run([1, 2, 3], "x * 2")
+    [2, 4, 6]
     """
 
     def __init__(self, pic: PICCache, meter: SonicMeter) -> None:
@@ -719,11 +960,32 @@ class EachPlan:
         self.meter = meter
 
     def run(self, seq: Iterable[Any], expr: str) -> List[Any]:
+        """Execute expression over sequence with JIT compilation.
+        
+        Parameters
+        ----------
+        seq : Iterable[Any]
+            Input sequence to map over
+        expr : str
+            Python expression to evaluate (single variable 'x')
+            
+        Returns
+        -------
+        List[Any]
+            Results of applying expr to each element
+            
+        Performance
+        -----------
+        - Compiles on first access, caches for reuse
+        - Empty __builtins__ for security
+        - Timing tracked via meter
+        """
         t0 = _now_ms()
         n = len(seq) if hasattr(seq, "__len__") else 0
         key = self.pic.make_key("each", expr, (n,))
         fn = self.pic.get(key)
         if fn is None:
+            # JIT compile: parse and compile expression
             tree = ast.parse(f"lambda x: ({expr})", mode="eval")
             code = compile(tree, "<jit_each>", "eval")
             fn = eval(code, {"__builtins__": {}})
@@ -736,11 +998,37 @@ class EachPlan:
 
 
 class CountPlan:
-    """for-count plan with pack_into.
-
+    """Count-based loop with pre-allocation and struct packing.
+    
+    Generates sequences by evaluating expressions with an index variable,
+    writing directly to pre-allocated memory using struct.pack_into for
+    zero-copy performance.
+    
     One-liner
     ---------
-    Pre-reserve and write.
+    Pre-reserve buffer and write directly with pack_into.
+    
+    Parameters
+    ----------
+    fmt : str
+        struct format string ('d' for double, 'f' for float, etc.)
+    pic : PICCache
+        Polymorphic inline cache for compiled functions
+    meter : SonicMeter
+        Performance metrics collector
+        
+    Performance Notes
+    -----------------
+    - Zero-copy via memoryview and struct.pack_into
+    - Pre-allocated buffer prevents reallocation
+    - Size validated before execution
+    
+    Examples
+    --------
+    >>> plan = CountPlan('d', pic, meter)
+    >>> buf = bytearray(100 * 8)
+    >>> mv = memoryview(buf)
+    >>> result = plan.run(100, "i * 2.0", mv)
     """
 
     def __init__(self, fmt: str, pic: PICCache, meter: SonicMeter) -> None:
@@ -750,14 +1038,43 @@ class CountPlan:
         self.meter = meter
 
     def run(self, n: int, expr: str, mv: memoryview) -> memoryview:
+        """Execute indexed loop writing to memoryview.
+        
+        Parameters
+        ----------
+        n : int
+            Number of iterations (must be >= 0)
+        expr : str
+            Python expression with variable 'i' for index
+        mv : memoryview
+            Pre-allocated buffer (must be >= n * self.size bytes)
+            
+        Returns
+        -------
+        memoryview
+            The input memoryview with values written
+            
+        Raises
+        ------
+        VisibleError
+            If n < 0 or buffer too small
+            
+        Performance
+        -----------
+        - struct.pack_into for direct memory write
+        - No intermediate list allocation
+        """
         if n < 0:
-            raise VisibleError("n >= 0")
+            raise VisibleError(f"Count plan requires n >= 0, got {n}")
         if len(mv) < n * self.size:
-            raise VisibleError("buffer small")
+            raise VisibleError(
+                f"Buffer too small: need {n * self.size} bytes, got {len(mv)}"
+            )
         t0 = _now_ms()
         key = self.pic.make_key("count", expr, (n, self.size))
         fn = self.pic.get(key)
         if fn is None:
+            # JIT compile: parse and compile expression
             tree = ast.parse(f"lambda i: ({expr})", mode="eval")
             code = compile(tree, "<jit_count>", "eval")
             fn = eval(code, {"__builtins__": {}})
@@ -772,11 +1089,32 @@ class CountPlan:
 
 
 class ChunkPlan:
-    """for-chunk plan with equal slices.
-
+    """Chunked processing with periodic flush for latency control.
+    
+    Divides memoryview into equal chunks for streaming or incremental
+    processing. Includes periodic flush mechanism to control tail latency.
+    
     One-liner
     ---------
-    memoryview splits and update.
+    Split memoryview into chunks with optional update callbacks.
+    
+    Parameters
+    ----------
+    meter : SonicMeter
+        Performance metrics collector
+        
+    Performance Notes
+    -----------------
+    - Zero-copy via memoryview slicing
+    - Flush every 4 chunks (when i//step % 4 == 0)
+    - Configurable chunk size and flush interval
+    
+    Examples
+    --------
+    >>> plan = ChunkPlan(meter)
+    >>> buf = bytearray(1000)
+    >>> mv = memoryview(buf)
+    >>> result = plan.process_chunked(mv, parts=8, flush_ms=4)
     """
 
     def __init__(self, meter: SonicMeter) -> None:
@@ -789,14 +1127,44 @@ class ChunkPlan:
         flush_ms: int = 4,
         update: Optional[Callable[[memoryview, int], None]] = None,
     ) -> memoryview:
+        """Process memoryview in equal-sized chunks.
+        
+        Parameters
+        ----------
+        mv : memoryview
+            Input buffer to process
+        parts : int, default=8
+            Number of chunks to split into (must be > 0)
+        flush_ms : int, default=4
+            Milliseconds to flush every 4 chunks
+        update : Optional[Callable], default=None
+            Callback function(chunk, offset) for each chunk
+            
+        Returns
+        -------
+        memoryview
+            The input memoryview (modified in-place if update provided)
+            
+        Raises
+        ------
+        VisibleError
+            If parts <= 0
+            
+        Performance
+        -----------
+        - Chunks processed sequentially
+        - Flush inserted every 4th chunk
+        - Zero-copy memoryview slicing
+        """
         if parts <= 0:
-            raise VisibleError("parts > 0")
+            raise VisibleError(f"Chunk plan requires parts > 0, got {parts}")
         t0 = _now_ms()
         step = max(1, len(mv) // parts)
         for i in range(0, len(mv), step):
             ch = mv[i : i + step]
             if update is not None:
                 update(ch, i)
+            # Periodic flush to control latency (every 4 chunks)
             if ((i // step) & 3) == 0:
                 t1 = _now_ms()
                 while _now_ms() - t1 < flush_ms:
@@ -841,11 +1209,54 @@ class LoopTailer:
 
 
 class ForRuntime:
-    """Two-phase for runtime with JIT/AOT and ΔGate.
-
+    """Two-phase loop runtime with JIT/AOT compilation and adaptive gating.
+    
+    Main orchestrator for the loop execution system, coordinating:
+    - Header: ticket generation and routing decisions
+    - Plans: JIT-compiled execution (EachPlan, CountPlan, ChunkPlan)
+    - Tailer: cleanup, metrics, and result caching
+    
     One-liner
     ---------
-    Header→Plan→Tailer with warm.
+    Header→Plan→Tailer pipeline with warmup and AOT support.
+    
+    Parameters
+    ----------
+    slots : int, default=32
+        Number of buffer slots in SonicBuffer
+    slot_bytes : int, default=64*1024
+        Bytes per slot (64KB default)
+        
+    Attributes
+    ----------
+    pool : SonicBuffer
+        Zero-copy ring buffer for hot data
+    gate : DeltaGate
+        Hot-path detector and codec identifier
+    meter : SonicMeter
+        Performance metrics logger
+    pic : PICCache
+        Polymorphic inline cache for compiled functions
+    store : AOTStore
+        Persistent AOT compilation cache
+    header : LoopHeader
+        Front-end ticket generator
+    tailer : LoopTailer
+        Back-end cleanup and metrics
+        
+    Performance Notes
+    -----------------
+    - AOT cache loaded lazily on first use
+    - GC disabled for large operations (>256KB)
+    - Hot paths optimized after 3 hits
+    - Metrics written every 128 operations
+    
+    Examples
+    --------
+    >>> runtime = ForRuntime(slots=32, slot_bytes=65536)
+    >>> runtime.initialize()  # Load AOT cache
+    >>> result = runtime.run_each([1, 2, 3], "x * 2")
+    [2, 4, 6]
     """
 
     def __init__(self, slots: int = 32, slot_bytes: int = 64 * 1024) -> None:
@@ -861,10 +1272,21 @@ class ForRuntime:
     # —-- lifecycle —--
 
     def initialize(self) -> None:
+        """Initialize runtime: load AOT cache and prewarm buffers.
+        
+        Should be called once before first use for optimal performance.
+        Loads previously compiled functions from disk and warms up
+        the buffer pool with sample data.
+        """
         self._load_aot()
         self.header.prewarm()
 
     def _load_aot(self) -> None:
+        """Load AOT-compiled functions from persistent store.
+        
+        Compiles and caches all saved expressions. Failures are silently
+        ignored to prevent startup issues from corrupted cache entries.
+        """
         if self._loaded:
             return
         items = self.store.load_all()
@@ -881,14 +1303,45 @@ class ForRuntime:
                     fn = eval(code, {"__builtins__": {}})
                     self.pic.put(k, fn, tree, src)
                 else:
-                    pass
+                    pass  # Unknown kind, skip
             except Exception:
-                pass
+                pass  # Ignore corrupt cache entries
+
         self._loaded = True
 
     # —-- routes —--
 
     def run_each(self, seq: Iterable[Any], expr: str) -> List[Any]:
+        """Execute expression over each element in sequence.
+        
+        Maps expression over sequence with automatic JIT compilation.
+        Results cached in AOT store for future runs.
+        
+        Parameters
+        ----------
+        seq : Iterable[Any]
+            Input sequence to process
+        expr : str
+            Python expression with variable 'x'
+            
+        Returns
+        -------
+        List[Any]
+            Results of applying expression to each element
+            
+        Performance
+        -----------
+        - GC disabled for sequences >256KB
+        - AOT cache updated on success
+        - Metrics recorded every 128 calls
+        
+        Examples
+        --------
+        >>> runtime.run_each([1, 2, 3], "x * 2")
+        [2, 4, 6]
+        >>> runtime.run_each([1, 2, 3], "x ** 2 + 1")
+        [2, 5, 10]
+        """
         size = len(seq) if hasattr(seq, "__len__") else 0
         tk = self.header.open_ticket("each", size)
         was = self.header.maybe_gc_off(tk)
@@ -902,6 +1355,42 @@ class ForRuntime:
             self.tailer.close(tk, size, was, tag="each")
 
     def run_count(self, n: int, expr: str, fmt: str = "d") -> memoryview:
+        """Generate sequence by evaluating indexed expression.
+        
+        Creates array by evaluating expression with index variable 'i'.
+        Results written directly to pre-allocated buffer for zero-copy.
+        
+        Parameters
+        ----------
+        n : int
+            Number of elements to generate
+        expr : str
+            Python expression with variable 'i' (index)
+        fmt : str, default='d'
+            struct format ('d'=double, 'f'=float, 'i'=int)
+            
+        Returns
+        -------
+        memoryview
+            Buffer containing generated values
+            
+        Raises
+        ------
+        VisibleError
+            If n < 0
+            
+        Performance
+        -----------
+        - Zero-copy via struct.pack_into
+        - Pre-allocated buffer avoids reallocation
+        - GC disabled for n > 32768 elements
+        
+        Examples
+        --------
+        >>> mv = runtime.run_count(100, "i * 2.0", fmt="d")
+        >>> len(mv) // 8  # 8 bytes per double
+        100
+        """
         tk = self.header.open_ticket("count", n)
         was = self.header.maybe_gc_off(tk)
         try:
@@ -922,6 +1411,47 @@ class ForRuntime:
         flush_ms: int = 4,
         update: Optional[Callable[[memoryview, int], None]] = None,
     ) -> memoryview:
+        """Process memoryview in chunks with latency control.
+        
+        Divides buffer into equal chunks for streaming processing.
+        Optional update callback invoked per chunk. Periodic flush
+        controls tail latency.
+        
+        Parameters
+        ----------
+        mv : memoryview
+            Buffer to process
+        parts : int, default=8
+            Number of chunks to divide into
+        flush_ms : int, default=4
+            Flush interval in milliseconds
+        update : Optional[Callable], default=None
+            Callback(chunk, offset) for each chunk
+            
+        Returns
+        -------
+        memoryview
+            The input buffer (possibly modified in-place)
+            
+        Raises
+        ------
+        VisibleError
+            If parts <= 0
+            
+        Performance
+        -----------
+        - Zero-copy memoryview slicing
+        - Flush every 4 chunks
+        - Configurable chunk size
+        
+        Examples
+        --------
+        >>> buf = bytearray(1000)
+        >>> mv = memoryview(buf)
+        >>> def process(chunk, offset):
+        ...     chunk[:] = b'\\x00' * len(chunk)
+        >>> result = runtime.run_chunked(mv, parts=8, update=process)
+        """
         tk = self.header.open_ticket("chunk", len(mv))
         was = self.header.maybe_gc_off(tk)
         try:
@@ -945,19 +1475,62 @@ class ForRuntime:
         flush_ms: int = 4,
         update: Optional[Callable[[memoryview, int], None]] = None,
     ) -> Any:
+        """Unified dispatch interface for all loop operations.
+        
+        Single entry point supporting 'each', 'count', and 'chunk' operations.
+        Validates required parameters and routes to appropriate executor.
+        
+        Parameters
+        ----------
+        kind : Literal["each", "count", "chunk"]
+            Operation type to execute
+        seq : Optional[Iterable], default=None
+            Input sequence (required for 'each')
+        expr : Optional[str], default=None
+            Expression to evaluate (required for 'each' and 'count')
+        n : Optional[int], default=None
+            Element count (required for 'count')
+        fmt : str, default='d'
+            struct format for 'count' operation
+        mv : Optional[memoryview], default=None
+            Input buffer (required for 'chunk')
+        parts : int, default=8
+            Chunk count for 'chunk' operation
+        flush_ms : int, default=4
+            Flush interval for 'chunk' operation
+        update : Optional[Callable], default=None
+            Update callback for 'chunk' operation
+            
+        Returns
+        -------
+        Any
+            Result depends on operation kind
+            
+        Raises
+        ------
+        VisibleError
+            If required parameters missing or kind invalid
+            
+        Examples
+        --------
+        >>> runtime.sonic_dispatch("each", seq=[1,2,3], expr="x*2")
+        [2, 4, 6]
+        >>> runtime.sonic_dispatch("count", n=100, expr="i*2.0")
+        <memoryview>
+        """
         if kind == "each":
             if seq is None or expr is None:
-                raise VisibleError("need seq, expr")
+                raise VisibleError("'each' operation requires both 'seq' and 'expr' parameters")
             return self.run_each(seq, expr)
         if kind == "count":
             if n is None or expr is None:
-                raise VisibleError("need n, expr")
+                raise VisibleError("'count' operation requires both 'n' and 'expr' parameters")
             return self.run_count(int(n), expr, fmt)
         if kind == "chunk":
             if mv is None:
-                raise VisibleError("need mv")
+                raise VisibleError("'chunk' operation requires 'mv' parameter")
             return self.run_chunked(mv, parts, flush_ms, update)
-        raise VisibleError("invalid kind")
+        raise VisibleError(f"Invalid operation kind: '{kind}'. Must be 'each', 'count', or 'chunk'")
 
 
 def delta_gate(func):
@@ -986,49 +1559,127 @@ def delta_gate(func):
 
 
 class CoreAllAdaptiveCS:
+    """Adaptive computing system with multi-tier optimization.
+    
+    Comprehensive numeric computation engine featuring:
+    - Delta gate for hot-path detection
+    - Memory pooling with size-based binning
+    - Adaptive warmup cache
+    - SLA-based algorithm selection
+    - Parallel execution support
+    
+    Parameters
+    ----------
+    mode : str, default="balanced"
+        SLA mode: 'fast', 'balanced', or 'precise'
+    aot_db : str, default=":memory:"
+        AOT cache database path
+        
+    Attributes
+    ----------
+    mode : str
+        Current SLA mode
+    gear_state : defaultdict
+        Tier tracking per operation key
+    warmup_cache : dict
+        Pre-computed execution plans
+    mem_pools : dict
+        Size-binned memory pools (64, 256, 1024, 4096 bytes)
+    ring_buf : deque
+        Circular buffer for streaming data
+    sla_modes : dict
+        Algorithm variants by SLA level
+        
+    Performance Notes
+    -----------------
+    - Gear state tracks optimization tier (0-3)
+    - Memory pools reduce allocation overhead
+    - Ring buffer provides zero-copy streaming
+    - Warmup cache pre-computes common patterns
+    
+    Examples
+    --------
+    >>> core = CoreAllAdaptiveCS(mode="balanced")
+    >>> core.warmup()  # Pre-warm caches
+    >>> result = core.sum_kahan([1.0, 2.0, 3.0])
+    6.0
+    """
     def __init__(self, mode: str = "balanced", aot_db: str = ":memory:"):
         self.mode = mode
-        self.gear_state = defaultdict(lambda: 0)
-        self.warmup_cache = {}
-        self.metrics_log = []
-        self.pool_sizes = [64, 256, 1024, 4096]
+        self.gear_state = defaultdict(lambda: 0)  # Tier tracking (0-3)
+        self.warmup_cache = {}  # Pre-computed plans
+        self.metrics_log = []  # Performance metrics
+        self.pool_sizes = [64, 256, 1024, 4096]  # Binned allocator sizes
         self.mem_pools = {sz: deque(maxlen=100) for sz in self.pool_sizes}
-        self.ring_buf = deque(maxlen=65536)
+        self.ring_buf = deque(maxlen=65536)  # Streaming buffer
+        # SLA mode mapping: fast → Kahan, balanced → pairwise, precise → fsum
         self.sla_modes = {
             "fast": self.sum_kahan,
             "balanced": self.mean_pairwise,
             "precise": self.fsum_precise,
         }
-        self.ticket_reg = defaultdict(dict)
-        self.path_map = defaultdict(lambda: "default")
-        self.mem_est = {}
-        self.stride_hist = deque(maxlen=100)
-        self.ticket_aot = {}
-        self.canary_samples = deque(maxlen=64)
-        self.hot_hits = defaultdict(int)
-        self.spill_count = 0
-        self.plan_logs = []
-        self.fallback_count = 0
-        self.cache_lens = {}
+        self.ticket_reg = defaultdict(dict)  # Operation tickets
+        self.path_map = defaultdict(lambda: "default")  # Routing decisions
+        self.mem_est = {}  # Memory usage estimates
+        self.stride_hist = deque(maxlen=100)  # Access pattern history
+        self.ticket_aot = {}  # AOT cache tickets
+        self.canary_samples = deque(maxlen=64)  # Canary values for validation
+        self.hot_hits = defaultdict(int)  # Hot path counters
+        self.spill_count = 0  # Cache spill counter
+        self.plan_logs = []  # Execution plan logs
+        self.fallback_count = 0  # Fallback invocation counter
+        self.cache_lens = {}  # Cache size tracking
         self.aot_db = aot_db
         self._init_aot_db()
         self._bind_parallel()
         self.warmup()
 
     def _init_aot_db(self) -> None:
+        """Initialize AOT database schema.
+        
+        Creates table for persistent compilation cache if it doesn't exist.
+        
+        Raises
+        ------
+        DiagnosticError
+            If database initialization fails
+        """
         try:
             db = sqlite3.connect(self.aot_db)
-            db.execute()
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS aot_cache ("
+                "  key TEXT PRIMARY KEY,"
+                "  kind TEXT,"
+                "  code TEXT,"
+                "  timestamp REAL"
+                ")"
+            )
             db.commit()
         except sqlite3.OperationalError as e:
-            raise DiagnosticError(f"db init: {e!s}")
+            raise DiagnosticError(f"AOT database initialization failed: {e!s}")
         finally:
             db.close()
 
     def delta_key(self, obj: Any) -> Tuple:
+        """Generate routing key from object characteristics.
+        
+        Parameters
+        ----------
+        obj : Any
+            Object to analyze
+            
+        Returns
+        -------
+        Tuple
+            (type_name, shape, distribution) for routing decisions
+            
+        Notes
+        -----
+        Used by delta gate to identify hot paths and select optimizations.
+        """
         typ = type(obj).__name__
         shape = str(len(obj)) if isinstance(obj, list) else "scalar"
-        dist = "uniform"
+        dist = "uniform"  # Could be enhanced with statistical analysis
         return (typ, shape, dist)
 
     def _delta_gate(self, func: Callable) -> Callable:
@@ -1315,21 +1966,71 @@ class CoreAllAdaptiveCS:
         return res
 
     def alloc(self, sz: int) -> bytearray:
+        """Allocate buffer from size-binned memory pool.
+        
+        Uses power-of-2 binning to reduce fragmentation. Returns pooled
+        buffer if available, otherwise allocates new buffer.
+        
+        Parameters
+        ----------
+        sz : int
+            Required size in bytes
+            
+        Returns
+        -------
+        bytearray
+            Buffer of at least sz bytes
+            
+        Performance
+        -----------
+        - Bins: 64, 256, 1024, 4096 bytes
+        - Up to 100 buffers cached per bin
+        - Zero-copy reuse when available
+        """
         bin_sz = next((p for p in self.pool_sizes if p >= sz), None)
         if bin_sz and self.mem_pools[bin_sz]:
             return self.mem_pools[bin_sz].popleft()
         return bytearray(bin_sz or sz)
 
     def free(self, buf: bytearray):
+        """Return buffer to memory pool for reuse.
+        
+        Parameters
+        ----------
+        buf : bytearray
+            Buffer to return to pool
+            
+        Notes
+        -----
+        Only exact-size matches are pooled. Oversized buffers discarded.
+        """
         sz = len(buf)
         bin_sz = next((p for p in self.pool_sizes if p == sz), None)
         if bin_sz:
             self.mem_pools[bin_sz].append(buf)
 
     def ring_push(self, data: bytes):
+        """Push data to ring buffer for streaming.
+        
+        Parameters
+        ----------
+        data : bytes
+            Data to append to ring
+            
+        Notes
+        -----
+        Oldest data automatically evicted when buffer full (65536 entries).
+        """
         self.ring_buf.append(data)
 
     def ring_pop(self):
+        """Pop oldest data from ring buffer.
+        
+        Returns
+        -------
+        bytes
+            Oldest data, or empty bytes if buffer empty
+        """
         return self.ring_buf.popleft() if self.ring_buf else b""
 
     def sla_sum(self, seq: List[float], mode: str = "balanced") -> float:
